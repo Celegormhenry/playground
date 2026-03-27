@@ -10,10 +10,22 @@ import torch.nn.functional as F
 
 
 def standard_softmax(x: torch.Tensor) -> torch.Tensor:
-    """Standard 2-pass softmax over last dimension."""
-    m = x.max(dim=-1, keepdim=True).values
-    e = torch.exp(x - m)
-    return e / e.sum(dim=-1, keepdim=True)
+    """Standard 2-pass softmax over last dimension.
+
+    Example: x = [2.0, 4.0, 1.0]
+
+    Pass 1 — find max (for numerical stability):
+        m = max(2.0, 4.0, 1.0) = 4.0
+
+    Pass 2 — subtract max, exponentiate, normalize:
+        x - m    = [2-4, 4-4, 1-4]       = [-2.0, 0.0, -3.0]
+        e        = exp([-2, 0, -3])       = [0.1353, 1.0, 0.0498]
+        sum(e)   = 0.1353 + 1.0 + 0.0498 = 1.1851
+        e/sum(e) = [0.1142, 0.8438, 0.0420]  <- final softmax
+    """
+    m = x.max(dim=-1, keepdim=True).values          # Pass 1: find max
+    e = torch.exp(x - m)                             # Pass 2: shift & exp
+    return e / e.sum(dim=-1, keepdim=True)           # normalize
 
 
 def online_softmax(x: torch.Tensor, block_size: int = 2) -> torch.Tensor:
@@ -122,6 +134,28 @@ def online_softmax_with_output_accumulation(
 
 # ──────────────────────────── Tests ────────────────────────────
 
+def test_standard_softmax():
+    """Standard softmax should match PyTorch's F.softmax and sum to 1."""
+    torch.manual_seed(42)
+    x = torch.randn(3, 10)
+
+    out = standard_softmax(x)
+    ref = F.softmax(x, dim=-1)
+
+    assert torch.allclose(out, ref, atol=1e-6), "Should match F.softmax"
+    row_sums = out.sum(dim=-1)
+    assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-6), \
+        "Rows should sum to 1"
+    assert (out >= 0).all(), "All values should be non-negative"
+
+    # Large values — check numerical stability
+    x_large = torch.tensor([[1000.0, 1001.0, 1002.0]])
+    out_large = standard_softmax(x_large)
+    assert not torch.any(torch.isnan(out_large)), "No NaNs with large values"
+    assert not torch.any(torch.isinf(out_large)), "No Infs with large values"
+    print("[PASS] standard_softmax matches F.softmax, sums to 1, numerically stable")
+
+
 def test_online_softmax_matches_standard():
     """Online softmax should match standard softmax exactly."""
     torch.manual_seed(42)
@@ -215,10 +249,96 @@ def demo_running_stats():
     print(f"Match: {torch.allclose(result, ref, atol=1e-6)}")
 
 
+def bench_softmax_speed():
+    """Compare speed of standard vs online softmax."""
+    import time
+
+    sizes = [64, 256, 1024, 4096]
+    block_sizes = [16, 64, 256]
+    warmup, repeats = 5, 50
+
+    print("\n=== Softmax Speed Comparison ===")
+    print(f"{'N':>6}  {'standard (ms)':>14}  ", end="")
+    for bs in block_sizes:
+        print(f"{'online bs=' + str(bs) + ' (ms)':>20}", end="  ")
+    print()
+    print("-" * (24 + 22 * len(block_sizes)))
+
+    for N in sizes:
+        x = torch.randn(32, N)
+
+        # Warmup & bench standard
+        for _ in range(warmup):
+            standard_softmax(x)
+        t0 = time.perf_counter()
+        for _ in range(repeats):
+            standard_softmax(x)
+        t_std = (time.perf_counter() - t0) / repeats * 1000
+
+        print(f"{N:>6}  {t_std:>14.4f}  ", end="")
+
+        for bs in block_sizes:
+            for _ in range(warmup):
+                online_softmax(x, block_size=bs)
+            t0 = time.perf_counter()
+            for _ in range(repeats):
+                online_softmax(x, block_size=bs)
+            t_online = (time.perf_counter() - t0) / repeats * 1000
+            print(f"{t_online:>20.4f}", end="  ")
+        print()
+
+
+def bench_attention_speed():
+    """Compare speed of naive attention vs tiled (online softmax) attention."""
+    import time
+
+    configs = [(2, 4, 64, 32), (2, 4, 256, 64), (2, 4, 1024, 64)]
+    block_sizes = [16, 64, 256]
+    warmup, repeats = 3, 20
+
+    print("\n=== Attention Speed Comparison ===")
+    print(f"{'(B,H,N,d)':>16}  {'naive (ms)':>12}  ", end="")
+    for bs in block_sizes:
+        print(f"{'tiled bs=' + str(bs) + ' (ms)':>20}", end="  ")
+    print()
+    print("-" * (32 + 22 * len(block_sizes)))
+
+    for B, H, N, d in configs:
+        Q = torch.randn(B, H, N, d)
+        K = torch.randn(B, H, N, d)
+        V = torch.randn(B, H, N, d)
+
+        # Naive attention
+        for _ in range(warmup):
+            F.scaled_dot_product_attention(Q, K, V)
+        t0 = time.perf_counter()
+        for _ in range(repeats):
+            F.scaled_dot_product_attention(Q, K, V)
+        t_naive = (time.perf_counter() - t0) / repeats * 1000
+
+        print(f"{'(' + ','.join(map(str,[B,H,N,d])) + ')':>16}  {t_naive:>12.4f}  ", end="")
+
+        for bs in block_sizes:
+            for _ in range(warmup):
+                online_softmax_with_output_accumulation(Q, K, V, block_size=bs)
+            t0 = time.perf_counter()
+            for _ in range(repeats):
+                online_softmax_with_output_accumulation(Q, K, V, block_size=bs)
+            t_tiled = (time.perf_counter() - t0) / repeats * 1000
+            print(f"{t_tiled:>20.4f}", end="  ")
+        print()
+
+    print("\nNote: Python-level tiling is slower than naive PyTorch/C++ ops.")
+    print("The real win comes from CUDA kernels that keep tiles in SRAM (FlashAttention).")
+
+
 if __name__ == "__main__":
+    test_standard_softmax()
     test_online_softmax_matches_standard()
     test_online_softmax_sums_to_one()
     test_tiled_attention_matches_naive()
     test_online_softmax_numerical_stability()
     demo_running_stats()
     print("\nAll tests passed!")
+    bench_softmax_speed()
+    bench_attention_speed()
