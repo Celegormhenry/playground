@@ -1,9 +1,10 @@
 /*
  * flash_attention_cuda.cu
  *
- * Two FlashAttention kernels:
+ * Three FlashAttention kernels:
  *   v1: tiles K/V only (one block per query row, D threads)
  *   v2: tiles BOTH Q and K/V (one block per Q tile, 256 threads, matmuls in smem)
+ *   v3: same as v2 but uses Tensor Cores (wmma) for matmuls (requires sm_70+)
  *
  * All matrices: (B, H, N, D)
  *   B = batch size, H = heads, N = seq length, D = head dim
@@ -11,6 +12,8 @@
 
 #include <torch/extension.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <mma.h>
 #include <float.h>
 
 // ════════════════════════════════════════════════════════════
@@ -259,6 +262,203 @@ __global__ void flash_attn_v2_kernel(
 
 
 // ════════════════════════════════════════════════════════════
+//  V3 KERNEL — Tensor Core (wmma) acceleration
+// ════════════════════════════════════════════════════════════
+//
+// Same algorithm as v2 (tile Q + KV, online softmax) but replaces
+// scalar dot-product loops with wmma 16×16×16 matmuls:
+//   - Q, K, V converted to fp16 in shared memory for Tensor Cores
+//   - S = Q @ K^T  via wmma (fp16 input, fp32 accumulate)
+//   - O += P @ V   via wmma (fp16 input, fp32 accumulate)
+//   - Softmax stays fp32 for numerical stability
+//
+// Requires compute capability >= 7.0 (Volta or newer)
+
+using namespace nvcuda;
+
+template <int BLOCK_Q, int BLOCK_KV, int D, int NUM_THREADS>
+__global__ void flash_attn_v3_kernel(
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ O,
+    int N, float scale)
+{
+    static_assert(BLOCK_Q % 16 == 0 && BLOCK_KV % 16 == 0 && D % 16 == 0,
+                  "wmma requires dimensions to be multiples of 16");
+
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int num_warps = NUM_THREADS / 32;
+
+    int q_start = blockIdx.x * BLOCK_Q;
+    int h = blockIdx.y;
+    int b = blockIdx.z;
+    int H = gridDim.y;
+    int bh = (b * H + h) * N * D;
+
+    // ── Shared memory layout ──
+    // Half-precision buffers (for wmma):
+    //   Q_half:   (BLOCK_Q, D)           — loaded once
+    //   K_T_half: (D, BLOCK_KV)          — K transposed, reloaded each iter
+    //   V_half:   (BLOCK_KV, D)          — reloaded each iter
+    //   P_half:   (BLOCK_Q, BLOCK_KV)    — softmax weights for wmma
+    // Float buffers (for softmax + accumulation):
+    //   S_smem:   (BLOCK_Q, BLOCK_KV)    — raw scores
+    //   O_smem:   (BLOCK_Q, D)           — output accumulator
+    //   m_smem:   (BLOCK_Q,)             — running max
+    //   l_smem:   (BLOCK_Q,)             — running sum
+    //   mn_smem:  (BLOCK_Q,)             — new max scratch
+    extern __shared__ char smem_raw[];
+    half*  Q_half   = (half*)smem_raw;
+    half*  K_T_half = Q_half   + BLOCK_Q * D;
+    half*  V_half   = K_T_half + D * BLOCK_KV;
+    half*  P_half   = V_half   + BLOCK_KV * D;
+    float* S_smem   = (float*)(P_half + BLOCK_Q * BLOCK_KV);
+    float* O_smem   = S_smem   + BLOCK_Q * BLOCK_KV;
+    float* m_smem   = O_smem   + BLOCK_Q * D;
+    float* l_smem   = m_smem   + BLOCK_Q;
+    float* mn_smem  = l_smem   + BLOCK_Q;
+
+    // ── Initialize accumulators ──
+    for (int i = tid; i < BLOCK_Q * D; i += NUM_THREADS)
+        O_smem[i] = 0.0f;
+    for (int i = tid; i < BLOCK_Q; i += NUM_THREADS) {
+        m_smem[i] = -FLT_MAX;
+        l_smem[i] = 0.0f;
+    }
+
+    // ── Load Q tile as fp16 (loaded once, reused across all KV tiles) ──
+    for (int i = tid; i < BLOCK_Q * D; i += NUM_THREADS) {
+        int qi = i / D, dx = i % D;
+        int g_row = q_start + qi;
+        Q_half[qi * D + dx] = __float2half(
+            (g_row < N) ? Q[bh + g_row * D + dx] : 0.0f);
+    }
+    __syncthreads();
+
+    // ═══════════ Main loop: stream K/V tiles ═══════════
+    for (int kv_start = 0; kv_start < N; kv_start += BLOCK_KV) {
+        int kv_len = min(BLOCK_KV, N - kv_start);
+
+        // ── Load K (transposed) and V as fp16 ──
+        // K(r, c) stored as K^T(c, r) for wmma: Q @ K^T = Q_half @ K_T_half
+        for (int i = tid; i < BLOCK_KV * D; i += NUM_THREADS) {
+            int r = i / D, c = i % D;
+            float k_val = (r < kv_len) ? K[bh + (kv_start + r) * D + c] : 0.0f;
+            float v_val = (r < kv_len) ? V[bh + (kv_start + r) * D + c] : 0.0f;
+            K_T_half[c * BLOCK_KV + r] = __float2half(k_val);
+            V_half[r * D + c] = __float2half(v_val);
+        }
+        __syncthreads();
+
+        // ── S = Q_half @ K_T_half via wmma ──
+        // (BLOCK_Q, D) @ (D, BLOCK_KV) → (BLOCK_Q, BLOCK_KV)
+        // Each warp computes one 16×16 output tile
+        {
+            constexpr int nm = BLOCK_Q / 16;
+            constexpr int nn = BLOCK_KV / 16;
+            constexpr int total_tiles = nm * nn;
+            for (int t = warp_id; t < total_tiles; t += num_warps) {
+                int tm = t / nn, tn = t % nn;
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+                wmma::fill_fragment(acc, 0.0f);
+                for (int k = 0; k < D; k += 16) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b;
+                    wmma::load_matrix_sync(a, &Q_half[tm * 16 * D + k], D);
+                    wmma::load_matrix_sync(b, &K_T_half[k * BLOCK_KV + tn * 16], BLOCK_KV);
+                    wmma::mma_sync(acc, a, b, acc);
+                }
+                wmma::store_matrix_sync(
+                    &S_smem[tm * 16 * BLOCK_KV + tn * 16], acc, BLOCK_KV, wmma::mem_row_major);
+            }
+        }
+        __syncthreads();
+
+        // ── Apply scale + mask padding columns ──
+        for (int i = tid; i < BLOCK_Q * BLOCK_KV; i += NUM_THREADS) {
+            int kj = i % BLOCK_KV;
+            S_smem[i] = (kj < kv_len) ? S_smem[i] * scale : -FLT_MAX;
+        }
+        __syncthreads();
+
+        // ── Online softmax step 1: find new row max ──
+        for (int qi = tid; qi < BLOCK_Q; qi += NUM_THREADS) {
+            float tile_max = -FLT_MAX;
+            for (int kj = 0; kj < BLOCK_KV; kj++)
+                tile_max = fmaxf(tile_max, S_smem[qi * BLOCK_KV + kj]);
+            mn_smem[qi] = fmaxf(m_smem[qi], tile_max);
+        }
+        __syncthreads();
+
+        // ── Online softmax step 2: rescale old O and l ──
+        for (int i = tid; i < BLOCK_Q * D; i += NUM_THREADS) {
+            int qi = i / D;
+            O_smem[i] *= expf(m_smem[qi] - mn_smem[qi]);
+        }
+        for (int qi = tid; qi < BLOCK_Q; qi += NUM_THREADS)
+            l_smem[qi] *= expf(m_smem[qi] - mn_smem[qi]);
+        __syncthreads();
+
+        // ── Online softmax step 3: P = exp(S - m_new), convert to fp16 ──
+        for (int i = tid; i < BLOCK_Q * BLOCK_KV; i += NUM_THREADS) {
+            int qi = i / BLOCK_KV;
+            float p = expf(S_smem[i] - mn_smem[qi]);
+            S_smem[i] = p;                       // keep fp32 for l update
+            P_half[i] = __float2half(p);          // fp16 copy for wmma
+        }
+        __syncthreads();
+
+        // ── Update l += rowsum(P) ──
+        for (int qi = tid; qi < BLOCK_Q; qi += NUM_THREADS) {
+            float l_add = 0.0f;
+            for (int kj = 0; kj < BLOCK_KV; kj++)
+                l_add += S_smem[qi * BLOCK_KV + kj];
+            l_smem[qi] += l_add;
+        }
+
+        // ── O += P_half @ V_half via wmma ──
+        // (BLOCK_Q, BLOCK_KV) @ (BLOCK_KV, D) → (BLOCK_Q, D)
+        // Load existing O into accumulator, add P@V, store back
+        {
+            constexpr int nm = BLOCK_Q / 16;
+            constexpr int nn = D / 16;
+            constexpr int total_tiles = nm * nn;
+            for (int t = warp_id; t < total_tiles; t += num_warps) {
+                int tm = t / nn, tn = t % nn;
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+                wmma::load_matrix_sync(
+                    acc, &O_smem[tm * 16 * D + tn * 16], D, wmma::mem_row_major);
+                for (int k = 0; k < BLOCK_KV; k += 16) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b;
+                    wmma::load_matrix_sync(a, &P_half[tm * 16 * BLOCK_KV + k], BLOCK_KV);
+                    wmma::load_matrix_sync(b, &V_half[k * D + tn * 16], D);
+                    wmma::mma_sync(acc, a, b, acc);
+                }
+                wmma::store_matrix_sync(
+                    &O_smem[tm * 16 * D + tn * 16], acc, D, wmma::mem_row_major);
+            }
+        }
+
+        // ── Update m ──
+        for (int qi = tid; qi < BLOCK_Q; qi += NUM_THREADS)
+            m_smem[qi] = mn_smem[qi];
+        __syncthreads();
+    }
+
+    // ── Final: O = O / l, write smem → HBM ──
+    for (int i = tid; i < BLOCK_Q * D; i += NUM_THREADS) {
+        int qi = i / D, dx = i % D;
+        int g_row = q_start + qi;
+        if (g_row < N)
+            O[bh + g_row * D + dx] = O_smem[i] / l_smem[qi];
+    }
+}
+
+
+// ════════════════════════════════════════════════════════════
 //  HOST LAUNCHERS
 // ════════════════════════════════════════════════════════════
 
@@ -328,6 +528,39 @@ torch::Tensor flash_attn_v2_fwd(torch::Tensor Q, torch::Tensor K, torch::Tensor 
 }
 
 
+torch::Tensor flash_attn_v3_fwd(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
+    TORCH_CHECK(Q.is_cuda() && Q.scalar_type() == torch::kFloat32 && Q.dim() == 4);
+    int B = Q.size(0), H = Q.size(1), N = Q.size(2), D = Q.size(3);
+
+    auto O = torch::empty_like(Q);
+    float scale = 1.0f / sqrtf((float)D);
+
+    constexpr int NUM_THREADS = 128;  // 4 warps
+    constexpr int BLOCK_Q = 16;
+
+    // smem = half_elems * 2 + float_elems * 4 bytes
+    // half:  Q(BQ*D) + K^T(D*BKV) + V(BKV*D) + P(BQ*BKV)
+    // float: S(BQ*BKV) + O(BQ*D) + m(BQ) + l(BQ) + mn(BQ)
+    #define V3_LAUNCH(BKV, DD) { \
+        constexpr int half_elems = BLOCK_Q*(DD) + (DD)*(BKV) + (BKV)*(DD) + BLOCK_Q*(BKV); \
+        constexpr int float_elems = BLOCK_Q*(BKV) + BLOCK_Q*(DD) + 3*BLOCK_Q; \
+        size_t smem = half_elems * sizeof(half) + float_elems * sizeof(float); \
+        dim3 grid(((N) + BLOCK_Q - 1) / BLOCK_Q, H, B); \
+        flash_attn_v3_kernel<BLOCK_Q, BKV, DD, NUM_THREADS><<<grid, NUM_THREADS, smem>>>( \
+            Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(), \
+            O.data_ptr<float>(), N, scale); \
+    }
+
+    if      (D == 32)  { V3_LAUNCH(64, 32)  }
+    else if (D == 64)  { V3_LAUNCH(64, 64)  }
+    else if (D == 128) { V3_LAUNCH(32, 128) }
+    else { TORCH_CHECK(false, "v3: D must be 32, 64, or 128"); }
+
+    #undef V3_LAUNCH
+    return O;
+}
+
+
 // ════════════════════════════════════════════════════════════
 //  PYBIND
 // ════════════════════════════════════════════════════════════
@@ -335,4 +568,5 @@ torch::Tensor flash_attn_v2_fwd(torch::Tensor Q, torch::Tensor K, torch::Tensor 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("flash_attn_v1_fwd", &flash_attn_v1_fwd, "FlashAttention v1 (tile KV only)");
     m.def("flash_attn_v2_fwd", &flash_attn_v2_fwd, "FlashAttention v2 (tile Q + KV)");
+    m.def("flash_attn_v3_fwd", &flash_attn_v3_fwd, "FlashAttention v3 (Tensor Core / wmma)");
 }

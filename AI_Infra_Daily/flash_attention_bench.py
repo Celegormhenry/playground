@@ -6,6 +6,7 @@ Compares:
   2. Python tiled attention (online_softmax_with_output_accumulation)
   3. CUDA v1: tile K/V only (one block per query row)
   4. CUDA v2: tile both Q and K/V (one block per Q tile, 256 threads)
+  5. CUDA v3: same as v2 but uses Tensor Cores (wmma) for matmuls
 """
 
 import torch
@@ -54,6 +55,12 @@ def test_correctness():
         assert err < 1e-3, f"v2 D={D}: err {err}"
         print(f"  v2 D={D:>3d}  max_error={err:.2e}  [PASS]")
 
+        # v3 (Tensor Core)
+        out = flash_cuda.flash_attn_v3_fwd(Q, K, V)
+        err = (out - ref).abs().max().item()
+        assert err < 1e-2, f"v3 D={D}: err {err}"  # fp16 matmul → slightly higher tolerance
+        print(f"  v3 D={D:>3d}  max_error={err:.2e}  [PASS]")
+
     print()
 
 
@@ -83,8 +90,8 @@ def bench_attention():
         (4, 8, 2048, 64),
     ]
 
-    header = f"{'(B,H,N,d)':>18}  {'SDPA (ms)':>10}  {'py tiled':>10}  {'CUDA v1':>10}  {'CUDA v2':>10}  {'v2/SDPA':>8}  {'v1->v2':>8}"
-    print("=== Attention Speed Comparison ===")
+    header = f"{'(B,H,N,d)':>18}  {'SDPA':>10}  {'py tiled':>10}  {'CUDA v1':>10}  {'CUDA v2':>10}  {'CUDA v3':>10}  {'v3/SDPA':>8}  {'v2->v3':>8}"
+    print("=== Attention Speed Comparison (ms) ===")
     print(header)
     print("-" * len(header))
 
@@ -106,14 +113,16 @@ def bench_attention():
 
         t_v2 = bench(lambda: flash_cuda.flash_attn_v2_fwd(Q, K, V))
 
-        v2_vs_sdpa = t_v2 / t_sdpa
-        v1_to_v2 = t_v1 / t_v2
+        t_v3 = bench(lambda: flash_cuda.flash_attn_v3_fwd(Q, K, V))
 
-        print(f"{label:>18}  {t_sdpa:>10.4f}  {t_py:>10.4f}  {t_v1:>10.4f}  {t_v2:>10.4f}  {v2_vs_sdpa:>7.1f}x  {v1_to_v2:>7.1f}x")
+        v3_vs_sdpa = t_v3 / t_sdpa
+        v2_to_v3 = t_v2 / t_v3
+
+        print(f"{label:>18}  {t_sdpa:>10.4f}  {t_py:>10.4f}  {t_v1:>10.4f}  {t_v2:>10.4f}  {t_v3:>10.4f}  {v3_vs_sdpa:>7.1f}x  {v2_to_v3:>7.1f}x")
 
     print()
-    print("v2/SDPA = how many times slower v2 is vs PyTorch (lower = better)")
-    print("v1->v2  = speedup from tiling Q (higher = better)")
+    print("v3/SDPA = how many times slower v3 is vs PyTorch (lower = better)")
+    print("v2->v3  = speedup from Tensor Cores (higher = better)")
 
 
 if __name__ == "__main__":
